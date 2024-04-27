@@ -10,7 +10,7 @@ Toy implementation to learn Apache Parquet.
 cd thrift
 
 # Download Thrift definition file for Parquet
-curl -o parquet.thrift https://raw.githubusercontent.com/apache/parquet-format/master/src/main/thrift/parquet.thrift
+curl -o parquet.thrift https://raw.githubusercontent.com/apache/parquet-format/apache-parquet-format-2.10.0/src/main/thrift/parquet.thrift
 
 # Build Thrift compiler(Docker container image) and generate code
 rm parquet/*
