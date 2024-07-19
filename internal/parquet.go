@@ -50,7 +50,7 @@ func (par *Parquet) Inspect(ctx context.Context) (*Structure, error) {
 	}
 
 	structure := &Structure{RowGroups: make([]*RowGroup, len(footer.RowGroups))}
-	structure.RootField, _ = inspectSchema(footer.Schema) // スキーマ情報を変換
+	structure.SchemaTree, _ = inspectSchema(footer.Schema, 0) // スキーマ情報を変換
 
 	// 行グループ毎に変換
 	for i := 0; i < len(footer.RowGroups); i++ {
@@ -71,7 +71,6 @@ func (par *Parquet) Inspect(ctx context.Context) (*Structure, error) {
 
 			structure.RowGroups[i].Columns[j] = &ColumnChunk{
 				Path:      strings.Join(col.MetaData.PathInSchema, "."),
-				Type:      col.MetaData.Type,
 				Codec:     col.MetaData.Codec,
 				NumValues: col.MetaData.NumValues,
 				Pages:     pages,
@@ -87,8 +86,14 @@ func (par *Parquet) seek(pos int64, whence int) (int64, error) {
 }
 
 // スキーマ情報の変換
-func inspectSchema(elements []*parquet.SchemaElement) (*Schema, []*parquet.SchemaElement) {
-	s := &Schema{Name: elements[0].Name, Type: elements[0].Type}
+func inspectSchema(elements []*parquet.SchemaElement, depth int) (*Schema, []*parquet.SchemaElement) {
+	s := &Schema{
+		Name:           elements[0].Name,
+		Type:           elements[0].Type,
+		TypeLength:     elements[0].TypeLength,
+		RepetitionType: elements[0].RepetitionType,
+		Depth:          depth,
+	}
 
 	// NumChildren を持つフィールドは、後続の NumChildren 個のフィールドをネストしたフィールドとして扱う
 	// NumChildren を持たないならネストしたフィールドは存在しないので、この時点で処理を返す
@@ -96,13 +101,16 @@ func inspectSchema(elements []*parquet.SchemaElement) (*Schema, []*parquet.Schem
 		return s, elements[1:]
 	}
 
-	s.Nested = make([]*Schema, *elements[0].NumChildren)
+	numChildren := elements[0].GetNumChildren()
+	s.Children = make(map[string]*Schema, numChildren)
 	elements = elements[1:]
 
 	// ネストしたフィールドがさらにネストしていることもあるので、
 	// それぞれについて再帰的に処理する
-	for i := 0; i < len(s.Nested); i++ {
-		s.Nested[i], elements = inspectSchema(elements)
+	var child *Schema
+	for i := int32(0); i < numChildren; i++ {
+		child, elements = inspectSchema(elements, depth+1)
+		s.Children[child.Name] = child
 	}
 
 	return s, elements
@@ -161,6 +169,11 @@ func (par *Parquet) inspectPages(ctx context.Context, col *parquet.ColumnChunk) 
 		case parquet.PageType_DATA_PAGE:
 			page.NumValues = header.DataPageHeader.NumValues
 			page.Encoding = header.DataPageHeader.Encoding
+			page.Data = &DataPage{
+				RepetitionLevelEncoding: header.DataPageHeader.RepetitionLevelEncoding,
+				DefinitionLevelEncoding: header.DataPageHeader.DefinitionLevelEncoding,
+			}
+
 			pages = append(pages, page)
 
 		case parquet.PageType_DICTIONARY_PAGE:
@@ -187,4 +200,17 @@ func (par *Parquet) inspectPages(ctx context.Context, col *parquet.ColumnChunk) 
 	}
 
 	return pages, nil
+}
+
+func (par *Parquet) Read(offset, size int64) ([]byte, error) {
+	if _, err := par.seek(offset, io.SeekStart); err != nil {
+		return nil, fmt.Errorf("failed to seek parquet file(offset: %d, size: %d): %w)", offset, size, err)
+	}
+
+	buf := make([]byte, size)
+	if _, err := io.ReadFull(par.r, buf); err != nil {
+		return nil, fmt.Errorf("failed to read parquet file(offset: %d, size: %d): %w)", offset, size, err)
+	}
+
+	return buf, nil
 }

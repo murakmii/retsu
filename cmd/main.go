@@ -13,9 +13,14 @@ func main() {
 	inspectCmd := flag.NewFlagSet("inspect", flag.ExitOnError)
 	inspectPathArg := inspectCmd.String("path", "", "file path of parquet file to inspect")
 
+	sumInt64Cmd := flag.NewFlagSet("sum-int64", flag.ExitOnError)
+	sumInt64PathArg := sumInt64Cmd.String("path", "", "file path of parquet file to sum of int64 column")
+	sumInt64FieldArg := sumInt64Cmd.String("field", "", "field path of parquet file to sum of int64 column")
+
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: %s (inspect|TODO)\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage: %s (inspect|sum-int64)\n\n", os.Args[0])
 		inspectCmd.Usage()
+		sumInt64Cmd.Usage()
 	}
 
 	if len(os.Args) < 2 {
@@ -27,6 +32,13 @@ func main() {
 	case "inspect":
 		inspectCmd.Parse(os.Args[2:])
 		if err := inspect(*inspectPathArg); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+
+	case "sum-int64":
+		sumInt64Cmd.Parse(os.Args[2:])
+		if err := sumInt64(*sumInt64PathArg, *sumInt64FieldArg); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
@@ -61,5 +73,32 @@ func inspect(path string) error {
 	}
 
 	fmt.Println(string(j))
+	return nil
+}
+
+func sumInt64(path string, field string) error {
+	if len(path) == 0 || len(field) == 0 {
+		flag.Usage()
+		os.Exit(2)
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("failed to open parquet file: %w", err)
+	}
+	defer f.Close()
+
+	par := internal.NewParquet(f)
+	reader, err := internal.NewReader[int64](context.Background(), par)
+	if err != nil {
+		return fmt.Errorf("failed to create reader: %w", err)
+	}
+
+	aggregator := internal.NewIntSumAggregator[int64]()
+	if err := reader.Aggregate(field, internal.Int64Decoder, aggregator); err != nil {
+		return fmt.Errorf("failed to aggregate field '%s': %w", field, err)
+	}
+
+	fmt.Printf("Sum: %d\n", aggregator.Result())
 	return nil
 }
