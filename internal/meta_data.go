@@ -7,7 +7,7 @@ import (
 
 // Parquetファイルの構造を表すための一連の構造体
 type (
-	Structure struct {
+	MetaData struct {
 		SchemaTree *Schema     `json:"schema_tree"`
 		RowGroups  []*RowGroup `json:"row_groups"`
 	}
@@ -34,13 +34,12 @@ type (
 	}
 
 	Page struct {
-		Type             parquet.PageType `json:"type"`
-		UncompressedSize int32            `json:"uncompressed_size"`
-		CompressedSize   int32            `json:"compressed_size"`
-		Offset           int64            `json:"offset"`
-		NumValues        int32            `json:"num_values"`
-		Encoding         parquet.Encoding `json:"encoding"`
-		Data             *DataPage        `json:"data,omitempty"`
+		Type      parquet.PageType `json:"type"`
+		Size      int32            `json:"size"`
+		Offset    int64            `json:"offset"`
+		NumValues int32            `json:"num_values"`
+		Encoding  parquet.Encoding `json:"encoding"`
+		Data      *DataPage        `json:"data,omitempty"`
 	}
 
 	DataPage struct {
@@ -49,7 +48,7 @@ type (
 	}
 )
 
-func (s *Structure) FindSchema(path string) *Schema {
+func (s *MetaData) FindSchema(path string) *Schema {
 	schema := s.SchemaTree
 	var ok bool
 
@@ -65,7 +64,7 @@ func (s *Structure) FindSchema(path string) *Schema {
 	return schema
 }
 
-func (s *Structure) FindColumnChunk(path string) []*ColumnChunk {
+func (s *MetaData) FindColumnChunk(path string) []*ColumnChunk {
 	columns := make([]*ColumnChunk, 0)
 
 	for _, row := range s.RowGroups {

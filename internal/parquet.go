@@ -27,9 +27,9 @@ func NewParquet(r io.ReadSeeker) *Parquet {
 }
 
 // Parquetファイルを解析し、スキーマ等の構造を返す
-func (par *Parquet) Inspect(ctx context.Context) (*Structure, error) {
+func (par *Parquet) Inspect(ctx context.Context) (*MetaData, error) {
 	// ファイル末尾から8バイト戻った位置にある、フッター長を取得する
-	if _, err := par.seek(-8, io.SeekEnd); err != nil {
+	if _, err := par.r.Seek(-8, io.SeekEnd); err != nil {
 		return nil, fmt.Errorf("failed to seek to footer length: %w", err)
 	}
 
@@ -39,7 +39,7 @@ func (par *Parquet) Inspect(ctx context.Context) (*Structure, error) {
 	}
 
 	// フッター、フッター長、マジックナンバー分だけ末尾から先頭、つまりフッターの先頭にシークする
-	if _, err := par.seek(-int64(binary.LittleEndian.Uint32(footerLen))-8, io.SeekEnd); err != nil {
+	if _, err := par.r.Seek(-int64(binary.LittleEndian.Uint32(footerLen))-8, io.SeekEnd); err != nil {
 		return nil, fmt.Errorf("failed to seek to footer: %w", err)
 	}
 
@@ -49,12 +49,16 @@ func (par *Parquet) Inspect(ctx context.Context) (*Structure, error) {
 		return nil, fmt.Errorf("failed to read footer: %w", err)
 	}
 
-	structure := &Structure{RowGroups: make([]*RowGroup, len(footer.RowGroups))}
-	structure.SchemaTree, _ = inspectSchema(footer.Schema, 0) // スキーマ情報を変換
+	return par.inspectFooter(ctx, footer)
+}
+
+func (par *Parquet) inspectFooter(ctx context.Context, footer *parquet.FileMetaData) (*MetaData, error) {
+	metaData := &MetaData{RowGroups: make([]*RowGroup, len(footer.RowGroups))}
+	metaData.SchemaTree, _ = inspectSchema(footer.Schema, 0) // スキーマ情報を変換
 
 	// 行グループ毎に変換
 	for i := 0; i < len(footer.RowGroups); i++ {
-		structure.RowGroups[i] = &RowGroup{
+		metaData.RowGroups[i] = &RowGroup{
 			NumRows: footer.RowGroups[i].NumRows,
 			Columns: make([]*ColumnChunk, len(footer.RowGroups[i].Columns)),
 		}
@@ -69,7 +73,7 @@ func (par *Parquet) Inspect(ctx context.Context) (*Structure, error) {
 				return nil, fmt.Errorf("failed to inspect page of row=%d, col=%d: %w", i, j, err)
 			}
 
-			structure.RowGroups[i].Columns[j] = &ColumnChunk{
+			metaData.RowGroups[i].Columns[j] = &ColumnChunk{
 				Path:      strings.Join(col.MetaData.PathInSchema, "."),
 				Codec:     col.MetaData.Codec,
 				NumValues: col.MetaData.NumValues,
@@ -78,11 +82,7 @@ func (par *Parquet) Inspect(ctx context.Context) (*Structure, error) {
 		}
 	}
 
-	return structure, nil
-}
-
-func (par *Parquet) seek(pos int64, whence int) (int64, error) {
-	return par.r.Seek(pos, whence)
+	return metaData, nil
 }
 
 // スキーマ情報の変換
@@ -127,7 +127,7 @@ func (par *Parquet) inspectPages(ctx context.Context, col *parquet.ColumnChunk) 
 		offset = col.MetaData.DataPageOffset
 	}
 
-	if _, err := par.seek(offset, io.SeekStart); err != nil {
+	if _, err := par.r.Seek(offset, io.SeekStart); err != nil {
 		return nil, fmt.Errorf("failed to seek to head of pages(%d): %w", offset, err)
 	}
 
@@ -142,68 +142,70 @@ func (par *Parquet) inspectPages(ctx context.Context, col *parquet.ColumnChunk) 
 		endOfPages += col.MetaData.TotalUncompressedSize
 	}
 
-	var err error
 	pages := make([]*Page, 0)
+	var page *Page
+	var err error
 
 	// 1ページずつ読み取り、ページ群の終端に移動した時点で終了
 	for offset != endOfPages {
-		header := &parquet.PageHeader{}
-		if err := header.Read(ctx, par.proto); err != nil {
-			return nil, fmt.Errorf("failed to read page header(%d): %w", offset, err)
-		}
-
-		// 後からページ内容に簡単にアクセスできるよう、ページヘッダー読み取り後のオフセットを記録しておく
-		offset, err = par.seek(0, io.SeekCurrent)
+		page, offset, err = par.inspectNextPage(ctx, isCompressed)
 		if err != nil {
-			return nil, fmt.Errorf("failed to get current offset: %w", err)
+			return nil, fmt.Errorf("failed to inspect page(%d): %w", offset, err)
 		}
 
-		page := &Page{
-			Type:             header.Type,
-			UncompressedSize: header.UncompressedPageSize,
-			CompressedSize:   header.CompressedPageSize,
-			Offset:           offset,
-		}
-
-		switch page.Type {
-		case parquet.PageType_DATA_PAGE:
-			page.NumValues = header.DataPageHeader.NumValues
-			page.Encoding = header.DataPageHeader.Encoding
-			page.Data = &DataPage{
-				RepetitionLevelEncoding: header.DataPageHeader.RepetitionLevelEncoding,
-				DefinitionLevelEncoding: header.DataPageHeader.DefinitionLevelEncoding,
-			}
-
-			pages = append(pages, page)
-
-		case parquet.PageType_DICTIONARY_PAGE:
-			page.NumValues = header.DictionaryPageHeader.NumValues
-			page.Encoding = header.DictionaryPageHeader.Encoding
-			pages = append(pages, page)
-
-		default:
-			// nop
-		}
-
-		// 1ページの終端は、ページヘッダー読み取り後の位置に CompressedPageSize か UncompressedPageSize を加算することで求められる
-		// ページが圧縮されているなら前者、そうでないなら後者を加算する
-		if isCompressed {
-			offset += int64(header.CompressedPageSize)
-		} else {
-			offset += int64(header.UncompressedPageSize)
-		}
-
-		// この時点ではページ内容をデコードしなくても良いのでシークして読み飛ばす
-		if _, err := par.seek(offset, io.SeekStart); err != nil {
-			return nil, fmt.Errorf("failed to seek to next page(%d): %w", offset, err)
-		}
+		pages = append(pages, page)
 	}
 
 	return pages, nil
 }
 
+func (par *Parquet) inspectNextPage(ctx context.Context, isCompressed bool) (*Page, int64, error) {
+	header := &parquet.PageHeader{}
+	if err := header.Read(ctx, par.proto); err != nil {
+		return nil, 0, fmt.Errorf("failed to read page header: %w", err)
+	}
+
+	// 後からページ内容に簡単にアクセスできるよう、ページヘッダー読み取り後のオフセットを記録しておく
+	offset, err := par.r.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to get current offset: %w", err)
+	}
+
+	page := &Page{Type: header.Type, Offset: offset}
+	if isCompressed {
+		page.Size = header.CompressedPageSize
+	} else {
+		page.Size = header.UncompressedPageSize
+	}
+
+	switch page.Type {
+	case parquet.PageType_DATA_PAGE:
+		page.NumValues = header.DataPageHeader.NumValues
+		page.Encoding = header.DataPageHeader.Encoding
+		page.Data = &DataPage{
+			RepetitionLevelEncoding: header.DataPageHeader.RepetitionLevelEncoding,
+			DefinitionLevelEncoding: header.DataPageHeader.DefinitionLevelEncoding,
+		}
+
+	case parquet.PageType_DICTIONARY_PAGE:
+		page.NumValues = header.DictionaryPageHeader.NumValues
+		page.Encoding = header.DictionaryPageHeader.Encoding
+
+	default:
+		// nop
+	}
+
+	// この時点ではページ内容をデコードしなくても良いのでシークして読み飛ばす
+	offset += int64(page.Size)
+	if _, err := par.r.Seek(offset, io.SeekStart); err != nil {
+		return nil, 0, fmt.Errorf("failed to seek to next page(%d): %w", offset, err)
+	}
+
+	return page, offset, nil
+}
+
 func (par *Parquet) Read(offset, size int64) ([]byte, error) {
-	if _, err := par.seek(offset, io.SeekStart); err != nil {
+	if _, err := par.r.Seek(offset, io.SeekStart); err != nil {
 		return nil, fmt.Errorf("failed to seek parquet file(offset: %d, size: %d): %w)", offset, size, err)
 	}
 

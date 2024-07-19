@@ -10,18 +10,18 @@ import (
 
 type (
 	Reader[T any] struct {
-		par *Parquet
-		st  *Structure
+		par  *Parquet
+		meta *MetaData
 	}
 )
 
 func NewReader[T any](ctx context.Context, par *Parquet) (*Reader[T], error) {
-	st, err := par.Inspect(ctx)
+	meta, err := par.Inspect(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	return &Reader[T]{par: par, st: st}, nil
+	return &Reader[T]{par: par, meta: meta}, nil
 }
 
 func (r *Reader[T]) Aggregate(
@@ -29,12 +29,12 @@ func (r *Reader[T]) Aggregate(
 	decoder func([]byte) (T, []byte),
 	aggregator Aggregator[T],
 ) error {
-	schema := r.st.FindSchema(path)
+	schema := r.meta.FindSchema(path)
 	if schema == nil || !schema.IsLeaf() {
 		return fmt.Errorf("'%s' column does not exist", path)
 	}
 
-	for _, col := range r.st.FindColumnChunk(path) {
+	for _, col := range r.meta.FindColumnChunk(path) {
 		dict, err := r.readDict(col, decoder)
 		if err != nil {
 			return fmt.Errorf("failed to read dictionary page: %w", err)
@@ -111,14 +111,7 @@ func (r *Reader[T]) readDataPage(
 }
 
 func (r *Reader[T]) readPageContent(col *ColumnChunk, page *Page) ([]byte, error) {
-	var size int32
-	if col.Codec == parquet.CompressionCodec_UNCOMPRESSED {
-		size = page.UncompressedSize
-	} else {
-		size = page.CompressedSize
-	}
-
-	content, err := r.par.Read(page.Offset, int64(size))
+	content, err := r.par.Read(page.Offset, int64(page.Size))
 	if err != nil {
 		return nil, fmt.Errorf("failed to read page content: %w", err)
 	}
@@ -128,7 +121,7 @@ func (r *Reader[T]) readPageContent(col *ColumnChunk, page *Page) ([]byte, error
 		return content, nil
 
 	case parquet.CompressionCodec_ZSTD:
-		return zstd.Decompress(make([]byte, page.UncompressedSize), content)
+		return zstd.Decompress(nil, content)
 
 	default:
 		return nil, fmt.Errorf("unsupported compression codec %s", col.Codec)
