@@ -9,6 +9,7 @@ import (
 type (
 	MetaData struct {
 		SchemaTree *Schema     `json:"schema_tree"`
+		TotalRows  int64       `json:"total_rows"`
 		RowGroups  []*RowGroup `json:"row_groups"`
 	}
 
@@ -17,8 +18,8 @@ type (
 		Type           *parquet.Type                `json:"type,omitempty"`
 		TypeLength     *int32                       `json:"type_length,omitempty"`
 		RepetitionType *parquet.FieldRepetitionType `json:"repetition_type"`
-		Depth          int                          `json:"depth"`
 		Children       map[string]*Schema           `json:"children,omitempty"`
+		Depth          int                          `json:"depth"`
 	}
 
 	RowGroup struct {

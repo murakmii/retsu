@@ -53,7 +53,7 @@ func (par *Parquet) Inspect(ctx context.Context) (*MetaData, error) {
 }
 
 func (par *Parquet) inspectFooter(ctx context.Context, footer *parquet.FileMetaData) (*MetaData, error) {
-	metaData := &MetaData{RowGroups: make([]*RowGroup, len(footer.RowGroups))}
+	metaData := &MetaData{TotalRows: footer.NumRows, RowGroups: make([]*RowGroup, len(footer.RowGroups))}
 	metaData.SchemaTree, _ = inspectSchema(footer.Schema, 0) // スキーマ情報を変換
 
 	// 行グループ毎に変換
