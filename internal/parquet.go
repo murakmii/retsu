@@ -10,11 +10,17 @@ import (
 	"strings"
 )
 
-// Parquetファイルをデコードしていくための構造体
-type Parquet struct {
-	r     io.ReadSeeker // TProtocolだけではシーク等ができないので元の ReadSeeker も保持
-	proto thrift.TProtocol
-}
+type (
+	// Parquetファイル
+	Parquet struct {
+		r     io.ReadSeeker // TProtocolだけではシーク等ができないので元の ReadSeeker も保持
+		proto thrift.TProtocol
+	}
+
+	ThriftStruct interface {
+		Read(ctx context.Context, protocol thrift.TProtocol) error
+	}
+)
 
 func NewParquet(r io.ReadSeeker) *Parquet {
 	return &Parquet{
@@ -26,7 +32,7 @@ func NewParquet(r io.ReadSeeker) *Parquet {
 	}
 }
 
-// Parquetファイルを解析し、スキーマ等の構造を返す
+// Parquetファイルを解析し、スキーマ等のメタデータを返す
 func (par *Parquet) Inspect(ctx context.Context) (*MetaData, error) {
 	// ファイル末尾から8バイト戻った位置にある、フッター長を取得する
 	if _, err := par.r.Seek(-8, io.SeekEnd); err != nil {
@@ -45,15 +51,19 @@ func (par *Parquet) Inspect(ctx context.Context) (*MetaData, error) {
 
 	// フッターを読み取り、専用の構造体に変換していく
 	footer := &parquet.FileMetaData{}
-	if err := footer.Read(ctx, par.proto); err != nil {
+	if err := par.ReadThrift(ctx, footer); err != nil {
 		return nil, fmt.Errorf("failed to read footer: %w", err)
 	}
 
 	return par.inspectFooter(ctx, footer)
 }
 
+// フッターからのメタデータの取得
 func (par *Parquet) inspectFooter(ctx context.Context, footer *parquet.FileMetaData) (*MetaData, error) {
-	metaData := &MetaData{TotalRows: footer.NumRows, RowGroups: make([]*RowGroup, len(footer.RowGroups))}
+	metaData := &MetaData{
+		TotalRows: footer.NumRows,
+		RowGroups: make([]*RowGroup, len(footer.RowGroups)),
+	}
 	metaData.SchemaTree, _ = inspectSchema(footer.Schema, 0) // スキーマ情報を変換
 
 	// 行グループ毎に変換
@@ -67,17 +77,14 @@ func (par *Parquet) inspectFooter(ctx context.Context, footer *parquet.FileMetaD
 		for j := 0; j < len(footer.RowGroups[i].Columns); j++ {
 			col := footer.RowGroups[i].Columns[j]
 
-			// ページを変換
-			pages, err := par.inspectPages(ctx, col)
-			if err != nil {
-				return nil, fmt.Errorf("failed to inspect page of row=%d, col=%d: %w", i, j, err)
-			}
-
 			metaData.RowGroups[i].Columns[j] = &ColumnChunk{
-				Path:      strings.Join(col.MetaData.PathInSchema, "."),
-				Codec:     col.MetaData.Codec,
-				NumValues: col.MetaData.NumValues,
-				Pages:     pages,
+				Path:                  strings.Join(col.MetaData.PathInSchema, "."),
+				Codec:                 col.MetaData.Codec,
+				NumValues:             col.MetaData.NumValues,
+				TotalUncompressedSize: col.MetaData.TotalUncompressedSize,
+				TotalCompressedSize:   col.MetaData.TotalCompressedSize,
+				DataPageOffset:        col.MetaData.DataPageOffset,
+				DictPageOffset:        col.MetaData.DictionaryPageOffset,
 			}
 		}
 	}
@@ -86,7 +93,11 @@ func (par *Parquet) inspectFooter(ctx context.Context, footer *parquet.FileMetaD
 }
 
 // スキーマ情報の変換
+// リストに均された一連のスキーマ用構造体から、木構造のスキーマを復元して返す
+// 戻り値として、木構造に復元されたスキーマの親又は根となる単一の構造体と、
+// 木構造に復元されていない残りのリストを返す
 func inspectSchema(elements []*parquet.SchemaElement, depth int) (*Schema, []*parquet.SchemaElement) {
+	// リストの先頭を木構造のノードとしてSchema構造体に
 	s := &Schema{
 		Name:           elements[0].Name,
 		Type:           elements[0].Type,
@@ -95,8 +106,7 @@ func inspectSchema(elements []*parquet.SchemaElement, depth int) (*Schema, []*pa
 		Depth:          depth,
 	}
 
-	// NumChildren を持つフィールドは、後続の NumChildren 個のフィールドをネストしたフィールドとして扱う
-	// NumChildren を持たないならネストしたフィールドは存在しないので、この時点で処理を返す
+	// num_childrenが無いなら木構造の葉なので子については考えず、リストの先頭以外を未処理として返す
 	if !elements[0].IsSetNumChildren() {
 		return s, elements[1:]
 	}
@@ -105,10 +115,11 @@ func inspectSchema(elements []*parquet.SchemaElement, depth int) (*Schema, []*pa
 	s.Children = make(map[string]*Schema, numChildren)
 	elements = elements[1:]
 
-	// ネストしたフィールドがさらにネストしていることもあるので、
-	// それぞれについて再帰的に処理する
+	// 子となるnum_children分のスキーマについて、本関数を再帰的に呼び出して木構造を復元してく
 	var child *Schema
 	for i := int32(0); i < numChildren; i++ {
+		// 再帰的に処理した際、リストの要素のうちいくつが処理されるかは呼び出し時点では分からないので、
+		// 二番目の戻り値でリストを更新する
 		child, elements = inspectSchema(elements, depth+1)
 		s.Children[child.Name] = child
 	}
@@ -116,102 +127,31 @@ func inspectSchema(elements []*parquet.SchemaElement, depth int) (*Schema, []*pa
 	return s, elements
 }
 
-// ページ情報の変換
-func (par *Parquet) inspectPages(ctx context.Context, col *parquet.ColumnChunk) ([]*Page, error) {
-	// ページ群の先頭オフセットを求めシークする
-	// 辞書ページがあるならそのオフセット、辞書ページを持たないならデータページのオフセットが先頭になる
-	var offset int64
-	if col.MetaData.IsSetDictionaryPageOffset() {
-		offset = *col.MetaData.DictionaryPageOffset
-	} else {
-		offset = col.MetaData.DataPageOffset
-	}
-
+func (par *Parquet) Seek(offset int64) error {
 	if _, err := par.r.Seek(offset, io.SeekStart); err != nil {
-		return nil, fmt.Errorf("failed to seek to head of pages(%d): %w", offset, err)
+		return fmt.Errorf("failed to seek parquet file(offset: %d): %w)", offset, err)
 	}
 
-	// ページ群の終端のオフセットを求める
-	// 列チャンクより、ページ内容が圧縮されているなら TotalCompressedSize
-	// 圧縮されていないなら TotalUncompressedSize をページ群の先頭オフセットに加算した位置が終端となる
-	endOfPages := offset
-	isCompressed := col.MetaData.Codec != parquet.CompressionCodec_UNCOMPRESSED
-	if isCompressed {
-		endOfPages += col.MetaData.TotalCompressedSize
-	} else {
-		endOfPages += col.MetaData.TotalUncompressedSize
-	}
-
-	pages := make([]*Page, 0)
-	var page *Page
-	var err error
-
-	// 1ページずつ読み取り、ページ群の終端に移動した時点で終了
-	for offset != endOfPages {
-		page, offset, err = par.inspectNextPage(ctx, isCompressed)
-		if err != nil {
-			return nil, fmt.Errorf("failed to inspect page(%d): %w", offset, err)
-		}
-
-		pages = append(pages, page)
-	}
-
-	return pages, nil
+	return nil
 }
 
-func (par *Parquet) inspectNextPage(ctx context.Context, isCompressed bool) (*Page, int64, error) {
-	header := &parquet.PageHeader{}
-	if err := header.Read(ctx, par.proto); err != nil {
-		return nil, 0, fmt.Errorf("failed to read page header: %w", err)
-	}
-
-	// 後からページ内容に簡単にアクセスできるよう、ページヘッダー読み取り後のオフセットを記録しておく
+func (par *Parquet) CurrentOffset() (int64, error) {
 	offset, err := par.r.Seek(0, io.SeekCurrent)
 	if err != nil {
-		return nil, 0, fmt.Errorf("failed to get current offset: %w", err)
+		return -1, fmt.Errorf("failed to get current offset of parquet file: %w)", err)
 	}
 
-	page := &Page{Type: header.Type, Offset: offset}
-	if isCompressed {
-		page.Size = header.CompressedPageSize
-	} else {
-		page.Size = header.UncompressedPageSize
-	}
-
-	switch page.Type {
-	case parquet.PageType_DATA_PAGE:
-		page.NumValues = header.DataPageHeader.NumValues
-		page.Encoding = header.DataPageHeader.Encoding
-		page.Data = &DataPage{
-			RepetitionLevelEncoding: header.DataPageHeader.RepetitionLevelEncoding,
-			DefinitionLevelEncoding: header.DataPageHeader.DefinitionLevelEncoding,
-		}
-
-	case parquet.PageType_DICTIONARY_PAGE:
-		page.NumValues = header.DictionaryPageHeader.NumValues
-		page.Encoding = header.DictionaryPageHeader.Encoding
-
-	default:
-		// nop
-	}
-
-	// この時点ではページ内容をデコードしなくても良いのでシークして読み飛ばす
-	offset += int64(page.Size)
-	if _, err := par.r.Seek(offset, io.SeekStart); err != nil {
-		return nil, 0, fmt.Errorf("failed to seek to next page(%d): %w", offset, err)
-	}
-
-	return page, offset, nil
+	return offset, nil
 }
 
-func (par *Parquet) Read(offset, size int64) ([]byte, error) {
-	if _, err := par.r.Seek(offset, io.SeekStart); err != nil {
-		return nil, fmt.Errorf("failed to seek parquet file(offset: %d, size: %d): %w)", offset, size, err)
-	}
+func (par *Parquet) ReadThrift(ctx context.Context, t ThriftStruct) error {
+	return t.Read(ctx, par.proto)
+}
 
+func (par *Parquet) Read(size int64) ([]byte, error) {
 	buf := make([]byte, size)
 	if _, err := io.ReadFull(par.r, buf); err != nil {
-		return nil, fmt.Errorf("failed to read parquet file(offset: %d, size: %d): %w)", offset, size, err)
+		return nil, fmt.Errorf("failed to read parquet file(size: %d): %w)", size, err)
 	}
 
 	return buf, nil

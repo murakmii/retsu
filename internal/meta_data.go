@@ -28,27 +28,17 @@ type (
 	}
 
 	ColumnChunk struct {
-		Path      string                   `json:"path"`
-		Codec     parquet.CompressionCodec `json:"codec,omitempty"`
-		NumValues int64                    `json:"num_values"`
-		Pages     []*Page                  `json:"pages,omitempty"`
-	}
-
-	Page struct {
-		Type      parquet.PageType `json:"type"`
-		Size      int32            `json:"size"`
-		Offset    int64            `json:"offset"`
-		NumValues int32            `json:"num_values"`
-		Encoding  parquet.Encoding `json:"encoding"`
-		Data      *DataPage        `json:"data,omitempty"`
-	}
-
-	DataPage struct {
-		RepetitionLevelEncoding parquet.Encoding
-		DefinitionLevelEncoding parquet.Encoding
+		Path                  string                   `json:"path"`
+		Codec                 parquet.CompressionCodec `json:"codec,omitempty"`
+		NumValues             int64                    `json:"num_values"`
+		TotalUncompressedSize int64                    `json:"total_uncompressed_size"`
+		TotalCompressedSize   int64                    `json:"total_compressed_size"`
+		DataPageOffset        int64                    `json:"data_page_offset"`
+		DictPageOffset        *int64                   `json:"dict_page_offset"`
 	}
 )
 
+// 列の名前を指定してスキーマ情報を取得
 func (s *MetaData) FindSchema(path string) *Schema {
 	schema := s.SchemaTree
 	var ok bool
@@ -65,6 +55,7 @@ func (s *MetaData) FindSchema(path string) *Schema {
 	return schema
 }
 
+// 列の名前を指定して列チャンクを取得
 func (s *MetaData) FindColumnChunk(path string) []*ColumnChunk {
 	columns := make([]*ColumnChunk, 0)
 
@@ -83,32 +74,30 @@ func (schema *Schema) IsLeaf() bool {
 	return schema.Type != nil
 }
 
+func (col *ColumnChunk) HasDict() bool {
+	return col.DictPageOffset != nil
+}
+
+func (col *ColumnChunk) PageHeadOffset() int64 {
+	if col.HasDict() {
+		return *col.DictPageOffset
+	} else {
+		return col.DataPageOffset
+	}
+}
+
+func (col *ColumnChunk) PageTailOffset() int64 {
+	if col.Codec == parquet.CompressionCodec_UNCOMPRESSED {
+		return col.PageHeadOffset() + col.TotalUncompressedSize
+	} else {
+		return col.PageHeadOffset() + col.TotalCompressedSize
+	}
+}
+
 func (schema *Schema) HasRepetitionLevels() bool {
 	return schema.Depth > 1
 }
 
 func (schema *Schema) HasDefinitionLevels() bool {
 	return schema.RepetitionType != nil && *schema.RepetitionType != parquet.FieldRepetitionType_REQUIRED
-}
-
-func (col *ColumnChunk) HasDict() bool {
-	return len(col.Pages) > 0 && col.Pages[0].Type == parquet.PageType_DICTIONARY_PAGE
-}
-
-func (col *ColumnChunk) DictPage() *Page {
-	if col.HasDict() {
-		return col.Pages[0]
-	} else {
-		return nil
-	}
-}
-
-func (col *ColumnChunk) DataPages() []*Page {
-	dataPages := make([]*Page, 0)
-	for _, page := range col.Pages {
-		if page.Type == parquet.PageType_DATA_PAGE {
-			dataPages = append(dataPages, page)
-		}
-	}
-	return dataPages
 }

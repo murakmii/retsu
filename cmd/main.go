@@ -18,7 +18,7 @@ func main() {
 	sumInt64FieldArg := sumInt64Cmd.String("field", "", "field path of parquet file to sum of int64 column")
 
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: %s (inspect|sum-int64)\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage: %s <sub-command>\n\n", os.Args[0])
 		inspectCmd.Usage()
 		sumInt64Cmd.Usage()
 	}
@@ -89,16 +89,16 @@ func sumInt64(path string, field string) error {
 	defer f.Close()
 
 	par := internal.NewParquet(f)
-	reader, err := internal.NewReader[int64](context.Background(), par)
+	reader, err := internal.NewReader(context.Background(), par)
 	if err != nil {
 		return fmt.Errorf("failed to create reader: %w", err)
 	}
 
-	aggregator := internal.NewIntSumAggregator[int64]()
-	if err := reader.Aggregate(field, internal.Int64Decoder, aggregator); err != nil {
+	sum, err := reader.SumInt64(context.Background(), field)
+	if err != nil {
 		return fmt.Errorf("failed to aggregate field '%s': %w", field, err)
 	}
 
-	fmt.Printf("Sum: %d\n", aggregator.Result())
+	fmt.Printf("Sum: %d\n", sum)
 	return nil
 }

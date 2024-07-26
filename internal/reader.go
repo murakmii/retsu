@@ -9,88 +9,127 @@ import (
 )
 
 type (
-	Reader[T any] struct {
+	Reader struct {
 		par  *Parquet
 		meta *MetaData
 	}
 )
 
-func NewReader[T any](ctx context.Context, par *Parquet) (*Reader[T], error) {
+func NewReader(ctx context.Context, par *Parquet) (*Reader, error) {
 	meta, err := par.Inspect(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	return &Reader[T]{par: par, meta: meta}, nil
+	return &Reader{par: par, meta: meta}, nil
 }
 
-func (r *Reader[T]) Aggregate(
-	path string,
-	decoder func([]byte) (T, []byte),
-	aggregator Aggregator[T],
-) error {
+func (r *Reader) SumInt64(ctx context.Context, path string) (int64, error) {
 	schema := r.meta.FindSchema(path)
 	if schema == nil || !schema.IsLeaf() {
-		return fmt.Errorf("'%s' column does not exist", path)
+		return 0, fmt.Errorf("'%s' column does not exist", path)
 	}
 
+	var sum int64
 	for _, col := range r.meta.FindColumnChunk(path) {
-		dict, err := r.readDict(col, decoder)
-		if err != nil {
-			return fmt.Errorf("failed to read dictionary page: %w", err)
+		if err := r.par.Seek(col.PageHeadOffset()); err != nil {
+			return 0, err
 		}
 
-		for _, dataPage := range col.DataPages() {
-			if err := r.readDataPage(schema, col, dict, dataPage, decoder, aggregator); err != nil {
-				return fmt.Errorf("failed to read data page: %w", err)
+		var err error
+		var dict []int64
+
+		if col.HasDict() {
+			dict, err = r.readDict(ctx, col)
+			if err != nil {
+				return 0, fmt.Errorf("failed to read dictionary page: %w", err)
 			}
 		}
+
+		for {
+			offset, err := r.par.CurrentOffset()
+			if err != nil {
+				return 0, err
+			}
+
+			if offset == col.PageTailOffset() {
+				break
+			}
+
+			s, err := r.readDataPage(ctx, schema, col.Codec, dict)
+			if err != nil {
+				return 0, fmt.Errorf("failed to read data page: %w", err)
+			}
+
+			sum += s
+		}
 	}
 
-	return nil
+	return sum, nil
 }
 
-func (r *Reader[T]) readDict(col *ColumnChunk, decoder func([]byte) (T, []byte)) ([]T, error) {
-	if !col.HasDict() {
-		return nil, nil
-	}
-
-	dictPage := col.DictPage()
-	pageContent, err := r.readPageContent(col, dictPage)
+func (r *Reader) readDict(ctx context.Context, col *ColumnChunk) ([]int64, error) {
+	header, data, err := r.readCurrentPage(ctx, col.Codec)
 	if err != nil {
 		return nil, err
 	}
 
-	dict := make([]T, dictPage.NumValues)
-	for i := 0; i < int(dictPage.NumValues); i++ {
-		dict[i], pageContent = decoder(pageContent)
-	}
-
-	if len(pageContent) != 0 {
-		return nil, fmt.Errorf("invalid dictionary page length")
+	dict := make([]int64, header.DictionaryPageHeader.NumValues)
+	for i := 0; i < len(dict); i++ {
+		dict[i] = int64(binary.LittleEndian.Uint64(data))
+		data = data[8:]
 	}
 
 	return dict, nil
 }
 
-func (r *Reader[T]) readDataPage(
-	schema *Schema,
-	col *ColumnChunk,
-	dict []T,
-	page *Page,
-	decoder func([]byte) (T, []byte),
-	aggregator Aggregator[T],
-) error {
-	if page.Data.RepetitionLevelEncoding != parquet.Encoding_RLE {
-		return fmt.Errorf("unsupported repetition level encoding: %s", page.Data.RepetitionLevelEncoding)
-	}
-	if page.Data.DefinitionLevelEncoding != parquet.Encoding_RLE {
-		return fmt.Errorf("unsupported definition level encoding: %s", page.Data.DefinitionLevelEncoding)
+func (r *Reader) readCurrentPage(ctx context.Context, codec parquet.CompressionCodec) (*parquet.PageHeader, []byte, error) {
+	header := &parquet.PageHeader{}
+	if err := r.par.ReadThrift(ctx, header); err != nil {
+		return nil, nil, err
 	}
 
-	data, err := r.readPageContent(col, page)
+	var size int32
+	if codec == parquet.CompressionCodec_UNCOMPRESSED {
+		size = header.UncompressedPageSize
+	} else {
+		size = header.CompressedPageSize
+	}
+
+	data, err := r.par.Read(int64(size))
 	if err != nil {
-		return nil
+		return nil, nil, err
+	}
+
+	switch codec {
+	case parquet.CompressionCodec_ZSTD:
+		data, err = zstd.Decompress(nil, data)
+
+	case parquet.CompressionCodec_UNCOMPRESSED:
+	// nop
+	default:
+		return nil, nil, fmt.Errorf("unsupported compression codec %s", codec)
+	}
+
+	return header, data, nil
+}
+
+func (r *Reader) readDataPage(
+	ctx context.Context,
+	schema *Schema,
+	codec parquet.CompressionCodec,
+	dict []int64,
+) (int64, error) {
+	header, data, err := r.readCurrentPage(ctx, codec)
+	if err != nil {
+		return 0, err
+	}
+
+	if header.DataPageHeader.RepetitionLevelEncoding != parquet.Encoding_RLE {
+		return 0, fmt.Errorf("unsupported repetition level encoding: %s", header.DataPageHeader.RepetitionLevelEncoding)
+	}
+	if header.DataPageHeader.DefinitionLevelEncoding != parquet.Encoding_RLE {
+		return 0, fmt.Errorf("unsupported definition level encoding: %s", header.DataPageHeader.DefinitionLevelEncoding)
 	}
 
 	if schema.HasRepetitionLevels() {
@@ -100,39 +139,20 @@ func (r *Reader[T]) readDataPage(
 		data = skipLevel(data)
 	}
 
-	switch page.Encoding {
+	var sum int64
+
+	switch header.DataPageHeader.Encoding {
 	case parquet.Encoding_RLE_DICTIONARY:
-		readRLEDictionary(dict, data, aggregator)
-	default:
-		return fmt.Errorf("unsupported page encoding: %s", page.Encoding)
-	}
-
-	return nil
-}
-
-func (r *Reader[T]) readPageContent(col *ColumnChunk, page *Page) ([]byte, error) {
-	content, err := r.par.Read(page.Offset, int64(page.Size))
-	if err != nil {
-		return nil, fmt.Errorf("failed to read page content: %w", err)
-	}
-
-	switch col.Codec {
-	case parquet.CompressionCodec_UNCOMPRESSED:
-		return content, nil
-
-	case parquet.CompressionCodec_ZSTD:
-		return zstd.Decompress(nil, content)
+		bitWidth := data[0]
+		readRLE(data[1:], uint32(bitWidth), func(index uint32, repeated uint64) {
+			sum += dict[index] * int64(repeated)
+		})
 
 	default:
-		return nil, fmt.Errorf("unsupported compression codec %s", col.Codec)
+		return 0, fmt.Errorf("unsupported page encoding: %s", header.DataPageHeader.Encoding)
 	}
-}
 
-func readRLEDictionary[T any](dict []T, data []byte, aggregator Aggregator[T]) {
-	bitWidth := data[0]
-	readRLE(data[1:], uint32(bitWidth), func(value uint32, repeated uint64) {
-		aggregator.Aggregate(dict[value], repeated)
-	})
+	return sum, nil
 }
 
 func readRLE(data []byte, bitWidth uint32, callback func(uint32, uint64)) {
