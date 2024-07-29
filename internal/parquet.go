@@ -101,7 +101,6 @@ func inspectSchema(elements []*parquet.SchemaElement, depth int) (*Schema, []*pa
 	s := &Schema{
 		Name:           elements[0].Name,
 		Type:           elements[0].Type,
-		TypeLength:     elements[0].TypeLength,
 		RepetitionType: elements[0].RepetitionType,
 		Depth:          depth,
 	}

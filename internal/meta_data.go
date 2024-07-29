@@ -16,7 +16,6 @@ type (
 	Schema struct {
 		Name           string                       `json:"name"`
 		Type           *parquet.Type                `json:"type,omitempty"`
-		TypeLength     *int32                       `json:"type_length,omitempty"`
 		RepetitionType *parquet.FieldRepetitionType `json:"repetition_type"`
 		Children       map[string]*Schema           `json:"children,omitempty"`
 		Depth          int                          `json:"depth"`
@@ -52,6 +51,10 @@ func (s *MetaData) FindSchema(path string) *Schema {
 		}
 	}
 
+	if schema.Type == nil {
+		return nil
+	}
+
 	return schema
 }
 
@@ -68,10 +71,6 @@ func (s *MetaData) FindColumnChunk(path string) []*ColumnChunk {
 	}
 
 	return columns
-}
-
-func (schema *Schema) IsLeaf() bool {
-	return schema.Type != nil
 }
 
 func (col *ColumnChunk) HasDict() bool {
@@ -92,12 +91,4 @@ func (col *ColumnChunk) PageTailOffset() int64 {
 	} else {
 		return col.PageHeadOffset() + col.TotalCompressedSize
 	}
-}
-
-func (schema *Schema) HasRepetitionLevels() bool {
-	return schema.Depth > 1
-}
-
-func (schema *Schema) HasDefinitionLevels() bool {
-	return schema.RepetitionType != nil && *schema.RepetitionType != parquet.FieldRepetitionType_REQUIRED
 }
