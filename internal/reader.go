@@ -36,15 +36,7 @@ func (r *Reader) SumInt64(ctx context.Context, path string) (int64, error) {
 			return 0, err
 		}
 
-		var err error
-		var dict []int64
-
-		if col.HasDict() {
-			dict, err = r.readDict(ctx, col)
-			if err != nil {
-				return 0, fmt.Errorf("failed to read dictionary page: %w", err)
-			}
-		}
+		fmt.Println("* Next column chunk")
 
 		for {
 			offset, err := r.par.CurrentOffset()
@@ -56,12 +48,16 @@ func (r *Reader) SumInt64(ctx context.Context, path string) (int64, error) {
 				break
 			}
 
-			s, err := r.readDataPage(ctx, schema, col.Codec, dict)
+			header, data, err := r.readCurrentPage(ctx, col.Codec)
 			if err != nil {
 				return 0, err
 			}
 
-			sum += s
+			fmt.Printf("Page type: %s, size: %d\n", header.Type, len(data))
+
+			if header.DataPageHeader != nil {
+				fmt.Printf("Data encoding: %s\n", header.DataPageHeader.Encoding)
+			}
 		}
 	}
 

@@ -3,58 +3,27 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"github.com/murakmii/retsu/internal"
 	"os"
 )
 
 func main() {
-	inspectCmd := flag.NewFlagSet("inspect", flag.ExitOnError)
-	inspectPathArg := inspectCmd.String("path", "", "file path of parquet file to inspect")
-
-	sumInt64Cmd := flag.NewFlagSet("sum-int64", flag.ExitOnError)
-	sumInt64PathArg := sumInt64Cmd.String("path", "", "file path of parquet file to sum of int64 column")
-	sumInt64FieldArg := sumInt64Cmd.String("field", "", "field path of parquet file to sum of int64 column")
-
-	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: %s <sub-command>\n\n", os.Args[0])
-		inspectCmd.Usage()
-		sumInt64Cmd.Usage()
-	}
-
-	if len(os.Args) < 2 {
-		flag.Usage()
-		os.Exit(2)
-	}
-
 	switch os.Args[1] {
 	case "inspect":
-		inspectCmd.Parse(os.Args[2:])
-		if err := inspect(*inspectPathArg); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
+		if err := inspect(os.Args[2]); err != nil {
+			panic(err)
 		}
-
 	case "sum-int64":
-		sumInt64Cmd.Parse(os.Args[2:])
-		if err := sumInt64(*sumInt64PathArg, *sumInt64FieldArg); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
+		if err := sumInt64(os.Args[2], os.Args[3]); err != nil {
+			panic(err)
 		}
-
 	default:
-		flag.Usage()
-		os.Exit(2)
+		panic("unknown command")
 	}
 }
 
 func inspect(path string) error {
-	if len(path) == 0 {
-		flag.Usage()
-		os.Exit(2)
-	}
-
 	f, err := os.Open(path)
 	if err != nil {
 		return fmt.Errorf("failed to open parquet file: %w", err)
@@ -77,11 +46,6 @@ func inspect(path string) error {
 }
 
 func sumInt64(path string, field string) error {
-	if len(path) == 0 || len(field) == 0 {
-		flag.Usage()
-		os.Exit(2)
-	}
-
 	f, err := os.Open(path)
 	if err != nil {
 		return fmt.Errorf("failed to open parquet file: %w", err)
