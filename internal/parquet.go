@@ -126,6 +126,19 @@ func inspectSchema(elements []*parquet.SchemaElement, depth int) (*Schema, []*pa
 	return s, elements
 }
 
+func (par *Parquet) ReadThrift(ctx context.Context, t ThriftStruct) error {
+	return t.Read(ctx, par.proto)
+}
+
+func (par *Parquet) Read(size int64) ([]byte, error) {
+	buf := make([]byte, size)
+	if _, err := io.ReadFull(par.r, buf); err != nil {
+		return nil, fmt.Errorf("failed to read parquet file(size: %d): %w)", size, err)
+	}
+
+	return buf, nil
+}
+
 func (par *Parquet) Seek(offset int64) error {
 	if _, err := par.r.Seek(offset, io.SeekStart); err != nil {
 		return fmt.Errorf("failed to seek parquet file(offset: %d): %w)", offset, err)
@@ -141,17 +154,4 @@ func (par *Parquet) CurrentOffset() (int64, error) {
 	}
 
 	return offset, nil
-}
-
-func (par *Parquet) ReadThrift(ctx context.Context, t ThriftStruct) error {
-	return t.Read(ctx, par.proto)
-}
-
-func (par *Parquet) Read(size int64) ([]byte, error) {
-	buf := make([]byte, size)
-	if _, err := io.ReadFull(par.r, buf); err != nil {
-		return nil, fmt.Errorf("failed to read parquet file(size: %d): %w)", size, err)
-	}
-
-	return buf, nil
 }
